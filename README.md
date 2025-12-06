@@ -64,10 +64,10 @@ graph TD
 
 ##  Key Features
 
-  * ** Secure Sandboxing:** All code executes inside an isolated Docker container (`python:3.9`). The agent can execute `rm -rf /` inside the container without harming the host machine.
-  * ** Event-Driven Design:** Built on `autogen-core`, utilizing `SingleThreadedAgentRuntime` and a centralized event bus rather than rigid sequential loops.
-  * ** Self-Healing Mechanism:** The agent analyzes `stderr` output. If a script fails (e.g., missing `requests` library or Git config error), the agent autonomously formulates a fix and retries.
-  * ** Full DevOps Capabilities:** Beyond Python, the agent writes **Bash scripts**, manages **Git Repositories**, and configures system environments (`apt-get`).
+  * **Secure Sandboxing:** All code executes inside an isolated Docker container (`python:3.9`). The agent can execute `rm -rf /` inside the container without harming the host machine.
+  * **Event-Driven Design:** Built on `autogen-core`, utilizing `SingleThreadedAgentRuntime` and a centralized event bus rather than rigid sequential loops.
+  * **Self-Healing Mechanism:** The agent analyzes `stderr` output. If a script fails (e.g., missing `requests` library or Git config error), the agent autonomously formulates a fix and retries.
+  * **Full DevOps Capabilities:** Beyond Python, the agent writes **Bash scripts**, manages **Git Repositories**, and configures system environments (`apt-get`).
 
 -----
 
