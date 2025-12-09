@@ -115,7 +115,7 @@ This project utilizes **Microsoft AutoGen (v0.7.5)** in a **Hub-and-Spoke** even
 ## Project Structure
 
 ```text
-self-healing-agent/
+agentic-devops-sandbox/
 ├── .env                  # API Keys (Ignored by Git)
 ├── main.py               # Entry point: Orchestrates the Team
 ├── prompts/              
