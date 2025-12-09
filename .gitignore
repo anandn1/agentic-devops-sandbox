@@ -3,3 +3,4 @@ venv/
 __pycache__/
 coding_workspace/
 *.log
+full_stack_workspace/

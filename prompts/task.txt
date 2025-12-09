@@ -1,0 +1,36 @@
+Build a Premium Flask Todo List App with Git Tracking.
+
+Phase 1: Setup
+- Initialize a Git repository.
+- Configure git user (email: dev@ai.com, name: DevBot).
+
+Phase 2: Backend Development (app.py)
+- Data Model: Use a list of dictionaries for tasks. Each task needs:
+    - 'id': Unique ID (integer).
+    - 'content': The task text.
+    - 'created_at': Timestamp string (e.g., "YYYY-MM-DD HH:MM").
+    - 'status': 'pending' or 'completed'.
+- Routes:
+    - '/' : Render index.html with tasks.
+    - '/add' (POST) : Add new task with timestamp and default 'pending' status.
+    - '/toggle/<int:task_id>' (POST) : Toggle status between 'pending' and 'completed'.
+    - '/delete/<int:task_id>' (POST) : Remove a task.
+- COMMIT this work.
+
+Phase 3: Frontend Development (templates/index.html)
+- Design: 
+    - Use a "Premium, Modern" aesthetic.
+    - Suggestion: Glassmorphism, soft shadows, rounded corners, gradient background.
+    - Beautiful typography (e.g., sans-serif).
+    - Responsive layout.
+- UI Elements:
+    - Header: "My Tasks".
+    - Task List: Display Content, Date, and Status.
+    - Controls: Buttons to Toggle Status (Complete/Undo) and Delete.
+    - Visuals: Strike-through or dim completed tasks.
+- COMMIT this work.
+
+Phase 4: QA
+- Verify adding, toggling, and deleting tasks works programmatically.
+- Verify the UI contains the new elements (Timestamp, Status buttons) in the HTML content.
+- Manager: Only terminate if QA passes.

@@ -129,6 +129,7 @@ graph TD
 self-healing-agent/
 ├── .env                # API Keys (Ignored by Git)
 ├── main.py             # Core Event-Driven Agent Logic
+├── prompts/            # Agent Persona & Task Prompts
 ├── requirements.txt    # Dependencies (pyautogen, docker, azure-core)
 ├── coding_workspace/   # Shared volume where Docker writes files
 └── logs/               # Execution logs demonstrating self-healing
