@@ -1,144 +1,218 @@
 import asyncio
 import os
-import re
-from dataclasses import dataclass
-from typing import List
-
 from dotenv import load_dotenv
-from autogen_core import DefaultTopicId, MessageContext, RoutedAgent, default_subscription, message_handler
-from autogen_core.code_executor import CodeBlock, CodeExecutor
-from autogen_core import SingleThreadedAgentRuntime
-from autogen_core.models import (
-    AssistantMessage,
-    ChatCompletionClient,
-    LLMMessage,
-    SystemMessage,
-    UserMessage,
-)
+
+from autogen_agentchat.agents import AssistantAgent, CodeExecutorAgent
+from autogen_agentchat.teams import SelectorGroupChat
+from autogen_agentchat.conditions import TextMentionTermination
 from autogen_ext.models.azure import AzureAIChatCompletionClient
 from autogen_ext.code_executors.docker import DockerCommandLineCodeExecutor
 from azure.core.credentials import AzureKeyCredential
+from autogen_core import EVENT_LOGGER_NAME
+from autogen_core.logging import LLMCallEvent
 
+import logging
 # Load environment variables
 load_dotenv()
 
-@dataclass
-class Message:
-    content: str
+# Configure Logging
+logging.basicConfig(level=logging.DEBUG)
+openai_logger = logging.getLogger("openai")
+openai_logger.setLevel(logging.INFO)
+http_logger = logging.getLogger("azure.core.pipeline.policies.http_logging_policy")
+http_logger.setLevel(logging.DEBUG)
 
-def confirm_execution(code_to_execute: str) -> bool:
-    print(f"\nExample of code to execute:\n{code_to_execute}\n")
-    response = input("Do you want to execute this code? (yes/no): ").strip().lower()
-    return response == "yes"
+class LLMUsageTracker(logging.Handler):
+    def __init__(self) -> None:
+        """Logging handler that tracks the number of tokens used in the prompt and completion."""
+        super().__init__()
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
 
-def extract_markdown_code_blocks(markdown_text: str) -> List[CodeBlock]:
-    pattern = re.compile(r"```(?:\s*([\w\+\-]+))?\n([\s\S]*?)```")
-    matches = pattern.findall(markdown_text)
-    code_blocks: List[CodeBlock] = []
-    for match in matches:
-        language = match[0].strip() if match[0] else ""
-        code_content = match[1]
-        code_blocks.append(CodeBlock(code=code_content, language=language))
-    return code_blocks
+    @property
+    def tokens(self) -> int:
+        return self._prompt_tokens + self._completion_tokens
 
-@default_subscription
-class Assistant(RoutedAgent):
-    def __init__(self, model_client: ChatCompletionClient) -> None:
-        super().__init__("Assistant")
-        self._model_client = model_client
-        self._chat_history: List[LLMMessage] = [
-            SystemMessage(
-                content="""You are an Autonomous DevOps Engineer.
-                
-                RULES:
-                1. If you need to save a file, you MUST use Bash commands (e.g., `echo` or `cat`) to create it.
-                2. If a system tool (like `git`) is missing, install it using `apt-get` (you have root access).
-                3. Always verify operations (e.g., check file existence, check git log).
-                4. Output "TERMINATE" only when the task is fully complete.
-                """
-            )
-        ]
+    @property
+    def prompt_tokens(self) -> int:
+        return self._prompt_tokens
 
-    @message_handler
-    async def handle_message(self, message: Message, ctx: MessageContext) -> None:
-        self._chat_history.append(UserMessage(content=message.content, source="user"))
-        result = await self._model_client.create(self._chat_history)
-        print(f"\n{'-'*80}\nAssistant:\n{result.content}")
-        self._chat_history.append(AssistantMessage(content=result.content, source="assistant"))
-        await self.publish_message(Message(content=result.content), DefaultTopicId())
+    @property
+    def completion_tokens(self) -> int:
+        return self._completion_tokens
 
-@default_subscription
-class Executor(RoutedAgent):
-    def __init__(self, code_executor: CodeExecutor) -> None:
-        super().__init__("Executor")
-        self._code_executor = code_executor
+    def reset(self) -> None:
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
 
-    @message_handler
-    async def handle_message(self, message: Message, ctx: MessageContext) -> None:
-        code_blocks = extract_markdown_code_blocks(message.content)
-        if code_blocks:
-            code_text = "\n".join([block.code for block in code_blocks])
-            
-            if not confirm_execution(code_text):
-                 print(f"\n{'-'*80}\nExecutor:\nCode execution rejected by user.")
-                 await self.publish_message(Message(content="Code execution was not approved. Reason: User input"), DefaultTopicId())
-                 return
+    def emit(self, record: logging.LogRecord) -> None:
+        """Emit the log record. To be used by the logging module."""
+        try:
+            # Use the StructuredMessage if the message is an instance of it
+            if isinstance(record.msg, LLMCallEvent):
+                event = record.msg
+                self._prompt_tokens += event.prompt_tokens
+                self._completion_tokens += event.completion_tokens
+        except Exception:
+            self.handleError(record)
 
-            result = await self._code_executor.execute_code_blocks(
-                code_blocks, cancellation_token=ctx.cancellation_token
-            )
-            print(f"\n{'-'*80}\nExecutor:\n{result.output}")
-            await self.publish_message(Message(content=result.output), DefaultTopicId())
+
+def load_prompt(filename):
+    with open(os.path.join("prompts", filename), "r") as f:
+        return f.read()
 
 async def main():
-    # Configuration for GitHub Models (Azure AI)
+    # Model Configuration
     model_client = AzureAIChatCompletionClient(
         model="gpt-4o",
         endpoint="https://models.inference.ai.azure.com",
         credential=AzureKeyCredential(os.environ.get("GITHUB_TOKEN")),
         model_info={
-            "json_output": True,
+            "json_output": False,
             "function_calling": True,
             "vision": True,
             "family": "gpt-4",
-            "structured_output": True,
+            "structured_output": False, 
         },
     )
 
-    work_dir = "coding_workspace"
+    # Setup LLM Usage Logger
+    logger = logging.getLogger(EVENT_LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    llm_usage = LLMUsageTracker()
+    logger.addHandler(llm_usage)
+
+    work_dir = os.path.abspath("full_stack_workspace")
     os.makedirs(work_dir, exist_ok=True)
 
-    runtime = SingleThreadedAgentRuntime()
+    # Load Prompts
+    manager_prompt = load_prompt("manager.txt")
+    backend_prompt = load_prompt("backend_dev.txt")
+    frontend_prompt = load_prompt("frontend_dev.txt")
+    qa_prompt = load_prompt("qa_engineer.txt")
+    task_prompt = load_prompt("task.txt")
 
-    async with DockerCommandLineCodeExecutor(
-        image="python:3.12",
-        timeout=60,
-        work_dir=work_dir,
-    ) as executor:
-        
-        await Assistant.register(
-            runtime, "assistant", lambda: Assistant(model_client=model_client)
-        )
-        await Executor.register(
-            runtime, "executor", lambda: Executor(code_executor=executor)
-        )
-
-        runtime.start()
-
-        task_prompt = """
-        Initialize a Git repository.
-        1. Create a '.gitignore' file that ignores '*.python', '*.bash', and '*.sh' files.
-        2. Initialize git and configure user 'bot@ai.com'.
-        3. Create 'app.py' that prints "Deployment Successful".
-        4. Commit 'app.py' (and only app.py).
-        5. Verify with 'git log'.
-        """
-        
-        print(f"Starting Self-Healing Agent (v0.7.5 New Arch - Core) in '{work_dir}'...")
-        await runtime.publish_message(Message(content=task_prompt), DefaultTopicId())
-
-        await runtime.stop_when_idle()
+    # 1. Define Agents
     
+    # Manager (Planning Agent)
+    manager = AssistantAgent(
+        name="Manager",
+        description="The Planning Agent. Breaks down complex tasks into subtasks for the team. First to engage.",
+        model_client=model_client,
+        system_message=manager_prompt
+    )
+
+    # Backend_Dev
+    backend_dev = AssistantAgent(
+        name="Backend_Dev",
+        description="The Backend Developer. Writes app.py using Flask and bash commands for file creation.",
+        model_client=model_client,
+        system_message=backend_prompt
+    )
+
+    # Frontend_Dev
+    frontend_dev = AssistantAgent(
+        name="Frontend_Dev",
+        description="The Frontend Developer. Writes templates/index.html using bash commands.",
+        model_client=model_client,
+        system_message=frontend_prompt
+    )
+    
+    # QA_Engineer
+    qa_engineer = AssistantAgent(
+        name="QA_Engineer",
+        description="The QA Engineer. Verifies the app runs and checks for correctness.",
+        model_client=model_client,
+        system_message=qa_prompt
+    )
+
+    # Executor (DOCKER)
+    async with DockerCommandLineCodeExecutor(
+        image="flask-agent-env", # Pre-baked image
+        work_dir=work_dir,
+        timeout=60
+    ) as code_executor:
+        
+        executor_agent = CodeExecutorAgent(
+            name="Executor",
+            description="The Tool Executor. Executes bash and python code blocks.",
+            code_executor=code_executor,
+        )
+
+        # 2. Define Team (SelectorGroupChat)
+        participants = [manager, backend_dev, frontend_dev, qa_engineer, executor_agent]
+        
+        # Termination condition
+        termination = TextMentionTermination("TERMINATE")
+
+        # Custom Selector Function to enforce "Dev -> Executor -> Dev" loop
+        def custom_selector(messages) -> str | None:
+            # print(f"[DEBUG] Selector called. Messages count: {len(messages)}")
+            if not messages:
+                return None
+            
+            last_msg = messages[-1]
+            last_speaker = getattr(last_msg, "source", "Unknown")
+            # print(f"[DEBUG] Last speaker: {last_speaker}")
+
+            # 1. If Executor just finished -> Hand back to the previous developer
+            if last_speaker == "Executor":
+                # Search backwards for the last dev who spoke
+                for m in reversed(messages[:-1]):
+                    src = getattr(m, "source", "Unknown")
+                    if src in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
+                        print(f"[DEBUG] Executor done. Returning to: {src}")
+                        return src
+                return "Manager"
+
+            # 2. If Developer wrote code -> Force Executor
+            if last_speaker in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
+                content = getattr(last_msg, "content", "")
+                if "```" in content:
+                    print("[DEBUG] Code detected. Forcing Executor.")
+                    return "Executor"
+            
+            # 3. If QA Passed -> Manager (to terminate)
+            if last_speaker == "QA_Engineer" and "PASS" in getattr(last_msg, "content", ""):
+                 print("[DEBUG] QA Passed. Returning to Manager.")
+                 return "Manager"
+
+            # print("[DEBUG] Returning None (Let LLM decide)")
+            return None # Let the LLM decide (e.g., Manager -> Dev)
+
+        team = SelectorGroupChat(
+            participants,
+            model_client=model_client,
+            termination_condition=termination,
+            max_turns=20, # Optimized for speed
+            selector_func=custom_selector,
+            # Explicit selector prompt to guide the model when func returns None
+            selector_prompt="""Select the next speaker. 
+            Available roles: {roles}. 
+            Chat History: {history}. 
+            Output only the role name."""
+        )
+
+        print(f"Starting High-Level Selector Squad (Docker) in '{work_dir}'...")
+        
+        # 4. Run using .run()
+        result = await team.run(task=task_prompt)
+        print(f"\n{'-'*20} Task Result {'-'*20}")
+        for message in result.messages:
+            script_source = getattr(message, "source", "Unknown")
+            print(f"\n{'-'*20} {script_source} {'-'*20}")
+            if hasattr(message, "content"):
+                print(message.content)
+            elif hasattr(message, "models_usage"):
+                print(f"[Task Result] Usage: {message.models_usage}")
+            else:
+                 print(message)
+        
+        print(f"\n{'-'*20} Token Usage {'-'*20}")
+        print(f"Prompt Tokens: {llm_usage.prompt_tokens}")
+        print(f"Completion Tokens: {llm_usage.completion_tokens}")
+        print(f"Total Tokens: {llm_usage.tokens}")
+
     await model_client.close()
 
 if __name__ == "__main__":
