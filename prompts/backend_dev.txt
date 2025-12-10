@@ -10,3 +10,6 @@ CRITICAL:
    - For Form POST requests, ALWAYS return `redirect('/')`. DO NOT return JSON for form actions.
 5. VERIFICATION: Create a separate `verification.py` script to test logic.
 6. BE CONCISE. OUTPUT CODE IMMEDIATELY. NO EXPLANATIONS.
+
+Do NOT write Frontend or QA code. 
+Once backend code is generated, output 'DONE' to pass the turn.
