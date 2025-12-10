@@ -1,7 +1,11 @@
 autogen-agentchat==0.7.5
-autogen-ext[docker,azure]==0.7.5
+autogen-ext[docker,azure,chromadb]==0.7.5
 python-dotenv
 docker
 azure-core
 azure-identity
 aiohttp
+chromadb
+sentence-transformers
+langchain-text-splitters
+PyYAML

@@ -4,3 +4,5 @@ __pycache__/
 coding_workspace/
 *.log
 full_stack_workspace/
+.chromadb_store/
+logs/

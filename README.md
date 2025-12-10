@@ -15,45 +15,59 @@ Unlike simple chatbots, this system runs in a **Dockerized Sandbox**, allowing a
 This project utilizes **Microsoft AutoGen (v0.7.5)** in a **Hub-and-Spoke** event-driven architecture. A `SelectorGroupChat` orchestrates the flow between agents based on clear handoff rules (e.g., *Dev -> Executor -> Dev*).
 
 ```mermaid
-    graph LR
-        %% Styles
-        classDef hub fill:#f9f9f9,stroke:#333,stroke-width:2px;
-        classDef agent fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
-        classDef box fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
-        classDef file fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,stroke-dasharray: 5 5;
+graph LR
+    %% Styles
+    classDef hub fill:#f9f9f9,stroke:#333,stroke-width:2px;
+    classDef agent fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef box fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    classDef db fill:#e1bee7,stroke:#8e24aa,stroke-width:2px;
+    classDef file fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,stroke-dasharray: 5 5;
 
-        %% Orchestration Layer
-        subgraph GroupChat ["SelectorGroupChat (Orchestration)"]
-            direction TB
-            Selector{{"Selector Logic"}}
-            
-            subgraph Squad ["Agent Team"]
-                Manager[("Manager")]
-                Backend[("Backend Dev")]
-                Frontend[("Frontend Dev")]
-                QA[("QA Engineer")]
-                Executor[("Executor")]
-            end
+    %% Orchestration Layer
+    subgraph GroupChat ["SelectorGroupChat (Orchestration)"]
+        direction TB
+        Selector{{"Selector Logic"}}
+        
+        subgraph Squad ["Agent Team"]
+        
+            Manager("Manager")
+            Backend("Backend Dev")
+            Frontend("Frontend Dev")
+            QA("QA Engineer")
+            Executor("Executor")
         end
+    end
 
-        %% Execution & Output
-        Selector <-->|Controls| Squad
-        Executor <==>|Run Code| Sandbox[("Docker Sandbox")]
-        Sandbox -->|Generates| Artifacts[("Code Files<br/>(app.py, templates/)")]
+    %% RAG System
+    subgraph Memory ["Long-Term Memory (RAG)"]
+        VectorDB[("ChromaDB Vector Store")]
+        Docs[("docs/coding_standards.md")]
+    end
 
-        %% Apply Styles
-        class Selector hub;
-        class Manager,Backend,Frontend,QA,Executor agent;
-        class Sandbox box;
-        class Artifacts file;
+    %% Execution & Output
+    Selector <-->|Controls| Manager
+    Docs -->|Indexed By| VectorDB
+    VectorDB <-->|Retrieves Context| Manager
+    
+    
+    Executor <-->|Run Code| Sandbox[("Docker Sandbox")]
+    
+    Sandbox -->|Generates| Artifacts[("Code Files<br/>(app.py, templates/)")]
+
+    %% Apply Styles
+    class Selector hub;
+    class Manager,Backend,Frontend,QA,Executor agent;
+    class Sandbox box;
+    class VectorDB db;
+    class Docs,Artifacts file;
 ```
-
 
 ##  Key Features
 
   * **Secure Sandboxing:** All code executes inside an isolated Docker container (`python:3.9`). The agent can execute `rm -rf /` inside the container without harming the host machine.
   * **Event-Driven Design:** Built on `autogen-core`, utilizing `SingleThreadedAgentRuntime` and a centralized event bus rather than rigid sequential loops.
   * **Self-Healing Mechanism:** The agent analyzes `stderr` output. If a script fails (e.g., missing `requests` library or Git config error), the agent autonomously formulates a fix and retries.
+  * **RAG Knowledge Base:** Agents retrieve specific coding standards and documentation from a local `docs/` folder using **ChromaDB**, ensuring code quality and consistency.
   * **Full DevOps Capabilities:** Beyond Python, the agent writes **Bash scripts**, manages **Git Repositories**, and configures system environments (`apt-get`).
 
 -----
@@ -77,6 +91,7 @@ This project utilizes **Microsoft AutoGen (v0.7.5)** in a **Hub-and-Spoke** even
 | **Orchestration** | AutoGen AgentChat v0.7.5 | Multi-agent coordination & selector logic |
 | **Sandbox** | Docker SDK | Isolated execution environment |
 | **LLM** | GitHub Models (GPT-4o) | High-level reasoning & code generation |
+| **Memory** | ChromaDB + LangChain | Vector-based document retrieval |
 | **Backend** | Flask (Python) | Generated application framework |
 
 -----
@@ -131,6 +146,9 @@ agentic-devops-sandbox/
 │   ├── frontend_dev.txt
 │   ├── qa_engineer.txt
 │   └── task.txt
+├── docs/                 # RAG Documents
+│   └── coding_standards.md
+├── memory.py             # Vector Database Logic
 ├── requirements.txt      # Dependencies
 ├── Dockerfile            # Sandbox Definition
 └── full_stack_workspace/ # Generated Web Application
@@ -144,7 +162,7 @@ agentic-devops-sandbox/
 *   [x] **Infrastructure:** Docker Container Integration
 *   [x] **Capability:** Git & System Administration
 *   [x] **Horizontal Scaling:** Implementing a "Manager Agent" to delegate tasks to sub-teams.
-*   [ ] **Long-Term Memory:** Integrating Vector DB (Chroma) to allow the agent to reference documentation.
+*   [x] **Long-Term Memory:** Integrating Vector DB (Chroma) to allow the agent to reference documentation.
 *   [ ] **Human-in-the-Loop:** Adding an approval step before `git push` operations.
 
 -----

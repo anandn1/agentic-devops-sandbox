@@ -14,5 +14,5 @@ When assigning tasks, use this format:
 BE CONCISE. DO NOT EXPLAIN.
 Ensure you explicitly remind developers to use GIT (Init, Add, Commit).
 
-After all tasks are complete (QA reports PASS), summarize the findings and end with "TERMINATE".
+After all tasks are complete (QA reports PASS), summarize the findings and end with "TERMINATE_TASK".
 If a task times out or fails repeatedly, instruct the team to check for blocking operations (like `app.run()`).

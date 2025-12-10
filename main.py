@@ -8,15 +8,40 @@ from autogen_agentchat.conditions import TextMentionTermination
 from autogen_ext.models.azure import AzureAIChatCompletionClient
 from autogen_ext.code_executors.docker import DockerCommandLineCodeExecutor
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
 from autogen_core import EVENT_LOGGER_NAME
 from autogen_core.logging import LLMCallEvent
 
 import logging
+import datetime
+from memory import create_memory_system
 # Load environment variables
 load_dotenv()
 
 # Configure Logging
-logging.basicConfig(level=logging.DEBUG)
+# 1. File Handler (Detailed Debug Logs)
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = f"logs/agent_run_{timestamp}.log"
+file_handler = logging.FileHandler(log_file)
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# 2. Console Handler (Minimal Info)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.ERROR) # Only show errors on console (and custom prints)
+
+# 3. Setup Root Logger
+root_logger = logging.getLogger()
+# Clear any default handlers (like those added by basicConfig or libraries)
+if root_logger.handlers:
+    root_logger.handlers.clear()
+
+root_logger.setLevel(logging.DEBUG)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# 4. Specific Loggers
 openai_logger = logging.getLogger("openai")
 openai_logger.setLevel(logging.INFO)
 http_logger = logging.getLogger("azure.core.pipeline.policies.http_logging_policy")
@@ -66,7 +91,7 @@ async def main():
     model_client = AzureAIChatCompletionClient(
         model="gpt-4o",
         endpoint="https://models.inference.ai.azure.com",
-        credential=AzureKeyCredential(os.environ.get("GITHUB_TOKEN")),
+        credential=AzureKeyCredential(os.environ.get("GITHUB_ACCESS_TOKEN")),
         model_info={
             "json_output": False,
             "function_calling": True,
@@ -92,6 +117,9 @@ async def main():
     qa_prompt = load_prompt("qa_engineer.txt")
     task_prompt = load_prompt("task.txt")
 
+    # Initialize Memory System
+    memories = await create_memory_system()
+
     # 1. Define Agents
     
     # Manager (Planning Agent)
@@ -99,7 +127,8 @@ async def main():
         name="Manager",
         description="The Planning Agent. Breaks down complex tasks into subtasks for the team. First to engage.",
         model_client=model_client,
-        system_message=manager_prompt
+        system_message=manager_prompt,
+        memory=memories
     )
 
     # Backend_Dev
@@ -107,7 +136,8 @@ async def main():
         name="Backend_Dev",
         description="The Backend Developer. Writes app.py using Flask and bash commands for file creation.",
         model_client=model_client,
-        system_message=backend_prompt
+        system_message=backend_prompt,
+        # memory=memories
     )
 
     # Frontend_Dev
@@ -115,7 +145,8 @@ async def main():
         name="Frontend_Dev",
         description="The Frontend Developer. Writes templates/index.html using bash commands.",
         model_client=model_client,
-        system_message=frontend_prompt
+        system_message=frontend_prompt,
+        # memory=memories
     )
     
     # QA_Engineer
@@ -123,7 +154,8 @@ async def main():
         name="QA_Engineer",
         description="The QA Engineer. Verifies the app runs and checks for correctness.",
         model_client=model_client,
-        system_message=qa_prompt
+        system_message=qa_prompt,
+        # memory=memories
     )
 
     # Executor (DOCKER)
@@ -143,42 +175,52 @@ async def main():
         participants = [manager, backend_dev, frontend_dev, qa_engineer, executor_agent]
         
         # Termination condition
-        termination = TextMentionTermination("TERMINATE")
+        termination = TextMentionTermination("TERMINATE_TASK")
 
         # Custom Selector Function to enforce "Dev -> Executor -> Dev" loop
         def custom_selector(messages) -> str | None:
-            # print(f"[DEBUG] Selector called. Messages count: {len(messages)}")
-            if not messages:
+            try:
+                # print(f"[DEBUG] Selector called. Messages count: {len(messages)}")
+                if not messages:
+                    return None
+                
+                last_msg = messages[-1]
+                last_speaker = getattr(last_msg, "source", "Unknown")
+                print(f">> Agent Working: {last_speaker}")
+
+                # 1. If Executor just finished -> Hand back to the previous developer
+                if last_speaker == "Executor":
+                    # Search backwards for the last dev who spoke
+                    for m in reversed(messages[:-1]):
+                        src = getattr(m, "source", "Unknown")
+                        if src in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
+                            # print(f"[DEBUG] Executor done. Returning to: {src}")
+                            return src
+                    return "Manager"
+
+                # 2. If Developer wrote code -> Force Executor
+                if last_speaker in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
+                    content = getattr(last_msg, "content", "")
+                    
+                    # Guard: If Backend_Dev tries to write HTML -> Force Frontend_Dev
+                    if last_speaker == "Backend_Dev" and ("<html>" in content or "<!DOCTYPE html>" in content):
+                        # print("[DEBUG] Backend trying to write HTML. Forcing Frontend_Dev.")
+                        return "Frontend_Dev"
+
+                    if "```" in content:
+                        # print("[DEBUG] Code detected. Forcing Executor.")
+                        return "Executor"
+                
+                # 3. If QA Passed -> Manager (to terminate)
+                if last_speaker == "QA_Engineer" and "PASS" in getattr(last_msg, "content", ""):
+                    # print("[DEBUG] QA Passed. Returning to Manager.")
+                    return "Manager"
+
+                # print("[DEBUG] Returning None (Let LLM decide)")
+                return None # Let the LLM decide (e.g., Manager -> Dev)
+            except Exception as e:
+                print(f"[ERROR] Selector Exception: {e}")
                 return None
-            
-            last_msg = messages[-1]
-            last_speaker = getattr(last_msg, "source", "Unknown")
-            # print(f"[DEBUG] Last speaker: {last_speaker}")
-
-            # 1. If Executor just finished -> Hand back to the previous developer
-            if last_speaker == "Executor":
-                # Search backwards for the last dev who spoke
-                for m in reversed(messages[:-1]):
-                    src = getattr(m, "source", "Unknown")
-                    if src in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
-                        print(f"[DEBUG] Executor done. Returning to: {src}")
-                        return src
-                return "Manager"
-
-            # 2. If Developer wrote code -> Force Executor
-            if last_speaker in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
-                content = getattr(last_msg, "content", "")
-                if "```" in content:
-                    print("[DEBUG] Code detected. Forcing Executor.")
-                    return "Executor"
-            
-            # 3. If QA Passed -> Manager (to terminate)
-            if last_speaker == "QA_Engineer" and "PASS" in getattr(last_msg, "content", ""):
-                 print("[DEBUG] QA Passed. Returning to Manager.")
-                 return "Manager"
-
-            # print("[DEBUG] Returning None (Let LLM decide)")
-            return None # Let the LLM decide (e.g., Manager -> Dev)
 
         team = SelectorGroupChat(
             participants,
@@ -193,25 +235,42 @@ async def main():
             Output only the role name."""
         )
 
-        print(f"Starting High-Level Selector Squad (Docker) in '{work_dir}'...")
+        # print(f"Starting High-Level Selector Squad (Docker) in '{work_dir}'...")
         
         # 4. Run using .run()
-        result = await team.run(task=task_prompt)
-        print(f"\n{'-'*20} Task Result {'-'*20}")
-        for message in result.messages:
-            script_source = getattr(message, "source", "Unknown")
-            print(f"\n{'-'*20} {script_source} {'-'*20}")
-            if hasattr(message, "content"):
-                print(message.content)
-            elif hasattr(message, "models_usage"):
-                print(f"[Task Result] Usage: {message.models_usage}")
+
+
+        # 4. Run using .run()
+        try:
+            print("Starting Agent Team...")
+            result = await team.run(task=task_prompt)
+            
+            print(f"\n{'-'*20} Task Result {'-'*20}")
+            # ... (rest of print logic)
+            for message in result.messages:
+                script_source = getattr(message, "source", "Unknown")
+                print(f"\n{'-'*20} {script_source} {'-'*20}")
+                if hasattr(message, "content"):
+                    print(message.content)
+                elif hasattr(message, "models_usage"):
+                    print(f"[Task Result] Usage: {message.models_usage}")
+                else:
+                        print(message)
+            
+            print(f"\n{'-'*20} Token Usage {'-'*20}")
+            print(f"Prompt Tokens: {llm_usage.prompt_tokens}")
+            print(f"Completion Tokens: {llm_usage.completion_tokens}")
+            print(f"Total Tokens: {llm_usage.tokens}")
+
+        except HttpResponseError as e:
+            if e.status_code == 429:
+                    print(f"\n[ERROR] Rate Limit Exceeded (429).")
             else:
-                 print(message)
-        
-        print(f"\n{'-'*20} Token Usage {'-'*20}")
-        print(f"Prompt Tokens: {llm_usage.prompt_tokens}")
-        print(f"Completion Tokens: {llm_usage.completion_tokens}")
-        print(f"Total Tokens: {llm_usage.tokens}")
+                    print(f"\n[ERROR] Azure API Error: {e.message}")
+        except KeyboardInterrupt:
+            print("\n[INFO] Run cancelled by user.")
+        except Exception as e:
+                print(f"\n[ERROR] Unexpected error: {str(e)}")
 
     await model_client.close()
 
