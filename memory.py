@@ -137,8 +137,8 @@ async def create_memory_system(docs_path: str = "docs") -> List[Memory]:
     memories.append(user_memory)
     
     # 2. RAG Memory (ChromaDB)
-    if os.path.exists(docs_path) and os.path.isdir(docs_path):
-        db_path = os.path.join(os.getcwd(), ".chromadb_store")
+    if Path(docs_path).exists() and Path(docs_path).is_dir():
+        db_path = str(Path.cwd() / ".chromadb_store")
         
         rag_memory = ChromaDBVectorMemory(
             config=PersistentChromaDBVectorMemoryConfig(
@@ -153,11 +153,13 @@ async def create_memory_system(docs_path: str = "docs") -> List[Memory]:
         )
         
         # Collect sources
+        # Collect sources
         sources = []
-        for root, _, files in os.walk(docs_path):
-            for file in files:
-                if file.endswith((".md", ".txt", ".html")):
-                    sources.append(os.path.join(root, file))
+        docs_dir = Path(docs_path)
+        if docs_dir.exists() and docs_dir.is_dir():
+            for file_path in docs_dir.rglob("*"):
+                if file_path.suffix in [".md", ".txt", ".html"]:
+                    sources.append(str(file_path))
         
         if sources:
              await rag_memory.clear()
@@ -179,8 +181,11 @@ if __name__ == "__main__":
         # Test Query
         if len(mems) > 1:
             rag = mems[1] 
-            print("Querying RAG...")
-            results = await rag.query(MemoryContent(content="What are the python naming conventions?", mime_type=MemoryMimeType.TEXT))
-            print(f"Results: {results}")
+            try:
+                print("Querying RAG...")
+                results = await rag.query(MemoryContent(content="What are the python naming conventions?", mime_type=MemoryMimeType.TEXT))
+                print(f"Results: {results}")
+            except Exception as e:
+                print(f"Error querying RAG: {e}")
 
     asyncio.run(main())

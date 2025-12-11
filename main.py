@@ -14,14 +14,17 @@ from autogen_core.logging import LLMCallEvent
 
 import logging
 import datetime
+from pathlib import Path
 from memory import create_memory_system
 # Load environment variables
 load_dotenv()
 
 # Configure Logging
 # 1. File Handler (Detailed Debug Logs)
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file = f"logs/agent_run_{timestamp}.log"
+log_file = log_dir / f"agent_run_{timestamp}.log"
 file_handler = logging.FileHandler(log_file)
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -83,15 +86,110 @@ class LLMUsageTracker(logging.Handler):
 
 
 def load_prompt(filename):
-    with open(os.path.join("prompts", filename), "r") as f:
-        return f.read()
+    return (Path("prompts") / filename).read_text()
+
+async def run_team_cycle(work_dir, model_client, memories, prompts):
+    """
+    Executes one cycle of the agent team.
+    Returns the result if successful, or raises exceptions.
+    """
+    manager_prompt, backend_prompt, frontend_prompt, qa_prompt, task_prompt = prompts
+
+    # 1. Define Agents (Re-created fresh each cycle to clear chat history)
+    manager = AssistantAgent(
+        name="Manager",
+        description="The Planning Agent. Breaks down complex tasks into subtasks for the team. First to engage.",
+        model_client=model_client,
+        system_message=manager_prompt,
+        memory=memories
+    )
+
+    backend_dev = AssistantAgent(
+        name="Backend_Dev",
+        description="The Backend Developer. Writes app.py using Flask and bash commands for file creation.",
+        model_client=model_client,
+        system_message=backend_prompt,
+    )
+
+    frontend_dev = AssistantAgent(
+        name="Frontend_Dev",
+        description="The Frontend Developer. Writes templates/index.html using bash commands.",
+        model_client=model_client,
+        system_message=frontend_prompt,
+    )
+    
+    qa_engineer = AssistantAgent(
+        name="QA_Engineer",
+        description="The QA Engineer. Verifies the app runs and checks for correctness.",
+        model_client=model_client,
+        system_message=qa_prompt,
+    )
+
+    # 2. Context Manager for Docker
+    async with DockerCommandLineCodeExecutor(
+        image="flask-agent-env", 
+        work_dir=work_dir,
+        timeout=60
+    ) as code_executor:
+        
+        executor_agent = CodeExecutorAgent(
+            name="Executor",
+            description="The Tool Executor. Executes bash and python code blocks.",
+            code_executor=code_executor,
+        )
+
+        participants = [manager, backend_dev, frontend_dev, qa_engineer, executor_agent]
+        termination = TextMentionTermination("TERMINATE_TASK")
+
+        # Custom Selector Function
+        def custom_selector(messages) -> str | None:
+            try:
+                if not messages: return None
+                last_msg = messages[-1]
+                last_speaker = getattr(last_msg, "source", "Unknown")
+                print(f">> Agent Working: {last_speaker}")
+
+                if last_speaker == "Executor":
+                    for m in reversed(messages[:-1]):
+                        src = getattr(m, "source", "Unknown")
+                        if src in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
+                            return src
+                    return "Manager"
+
+                if last_speaker in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
+                    content = getattr(last_msg, "content", "")
+                    if last_speaker == "Backend_Dev" and ("<html>" in content or "<!DOCTYPE html>" in content):
+                        return "Frontend_Dev"
+                    if "```" in content:
+                        return "Executor"
+                
+                if last_speaker == "QA_Engineer" and "PASS" in getattr(last_msg, "content", ""):
+                    return "Manager"
+
+                return None 
+            except Exception as e:
+                print(f"[ERROR] Selector Exception: {e}")
+                return None
+
+        team = SelectorGroupChat(
+            participants,
+            model_client=model_client,
+            termination_condition=termination,
+            max_turns=20, 
+            selector_func=custom_selector,
+            selector_prompt="Select the next speaker. Chat History: {history}. Output only the role name."
+        )
+
+        print("Starting Agent Team Cycle...")
+        return await team.run(task=task_prompt)
+
 
 async def main():
     # Model Configuration
     model_client = AzureAIChatCompletionClient(
         model="gpt-4o",
         endpoint="https://models.inference.ai.azure.com",
-        credential=AzureKeyCredential(os.environ.get("GITHUB_ACCESS_TOKEN")),
+        credential=AzureKeyCredential(os.environ.get("GITHUB_ACCESS_TOKEN1")),
         model_info={
             "json_output": False,
             "function_calling": True,
@@ -107,146 +205,36 @@ async def main():
     llm_usage = LLMUsageTracker()
     logger.addHandler(llm_usage)
 
-    work_dir = os.path.abspath("full_stack_workspace")
-    os.makedirs(work_dir, exist_ok=True)
+    work_dir = Path("full_stack_workspace").resolve()
+    work_dir.mkdir(exist_ok=True)
 
     # Load Prompts
-    manager_prompt = load_prompt("manager.txt")
-    backend_prompt = load_prompt("backend_dev.txt")
-    frontend_prompt = load_prompt("frontend_dev.txt")
-    qa_prompt = load_prompt("qa_engineer.txt")
-    task_prompt = load_prompt("task.txt")
+    prompts = (
+        load_prompt("manager.txt"),
+        load_prompt("backend_dev.txt"),
+        load_prompt("frontend_dev.txt"),
+        load_prompt("qa_engineer.txt"),
+        load_prompt("task.txt")
+    )
 
     # Initialize Memory System
     memories = await create_memory_system()
 
-    # 1. Define Agents
-    
-    # Manager (Planning Agent)
-    manager = AssistantAgent(
-        name="Manager",
-        description="The Planning Agent. Breaks down complex tasks into subtasks for the team. First to engage.",
-        model_client=model_client,
-        system_message=manager_prompt,
-        memory=memories
-    )
+    # --- MAIN LOOP FOR CONTEXT RESET ---
+    max_resets = 3
+    reset_count = 0
 
-    # Backend_Dev
-    backend_dev = AssistantAgent(
-        name="Backend_Dev",
-        description="The Backend Developer. Writes app.py using Flask and bash commands for file creation.",
-        model_client=model_client,
-        system_message=backend_prompt,
-        # memory=memories
-    )
-
-    # Frontend_Dev
-    frontend_dev = AssistantAgent(
-        name="Frontend_Dev",
-        description="The Frontend Developer. Writes templates/index.html using bash commands.",
-        model_client=model_client,
-        system_message=frontend_prompt,
-        # memory=memories
-    )
-    
-    # QA_Engineer
-    qa_engineer = AssistantAgent(
-        name="QA_Engineer",
-        description="The QA Engineer. Verifies the app runs and checks for correctness.",
-        model_client=model_client,
-        system_message=qa_prompt,
-        # memory=memories
-    )
-
-    # Executor (DOCKER)
-    async with DockerCommandLineCodeExecutor(
-        image="flask-agent-env", # Pre-baked image
-        work_dir=work_dir,
-        timeout=60
-    ) as code_executor:
-        
-        executor_agent = CodeExecutorAgent(
-            name="Executor",
-            description="The Tool Executor. Executes bash and python code blocks.",
-            code_executor=code_executor,
-        )
-
-        # 2. Define Team (SelectorGroupChat)
-        participants = [manager, backend_dev, frontend_dev, qa_engineer, executor_agent]
-        
-        # Termination condition
-        termination = TextMentionTermination("TERMINATE_TASK")
-
-        # Custom Selector Function to enforce "Dev -> Executor -> Dev" loop
-        def custom_selector(messages) -> str | None:
-            try:
-                # print(f"[DEBUG] Selector called. Messages count: {len(messages)}")
-                if not messages:
-                    return None
-                
-                last_msg = messages[-1]
-                last_speaker = getattr(last_msg, "source", "Unknown")
-                print(f">> Agent Working: {last_speaker}")
-
-                # 1. If Executor just finished -> Hand back to the previous developer
-                if last_speaker == "Executor":
-                    # Search backwards for the last dev who spoke
-                    for m in reversed(messages[:-1]):
-                        src = getattr(m, "source", "Unknown")
-                        if src in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
-                            # print(f"[DEBUG] Executor done. Returning to: {src}")
-                            return src
-                    return "Manager"
-
-                # 2. If Developer wrote code -> Force Executor
-                if last_speaker in ["Backend_Dev", "Frontend_Dev", "QA_Engineer"]:
-                    content = getattr(last_msg, "content", "")
-                    
-                    # Guard: If Backend_Dev tries to write HTML -> Force Frontend_Dev
-                    if last_speaker == "Backend_Dev" and ("<html>" in content or "<!DOCTYPE html>" in content):
-                        # print("[DEBUG] Backend trying to write HTML. Forcing Frontend_Dev.")
-                        return "Frontend_Dev"
-
-                    if "```" in content:
-                        # print("[DEBUG] Code detected. Forcing Executor.")
-                        return "Executor"
-                
-                # 3. If QA Passed -> Manager (to terminate)
-                if last_speaker == "QA_Engineer" and "PASS" in getattr(last_msg, "content", ""):
-                    # print("[DEBUG] QA Passed. Returning to Manager.")
-                    return "Manager"
-
-                # print("[DEBUG] Returning None (Let LLM decide)")
-                return None # Let the LLM decide (e.g., Manager -> Dev)
-            except Exception as e:
-                print(f"[ERROR] Selector Exception: {e}")
-                return None
-
-        team = SelectorGroupChat(
-            participants,
-            model_client=model_client,
-            termination_condition=termination,
-            max_turns=20, # Optimized for speed
-            selector_func=custom_selector,
-            # Explicit selector prompt to guide the model when func returns None
-            selector_prompt="""Select the next speaker. 
-            Available roles: {roles}. 
-            Chat History: {history}. 
-            Output only the role name."""
-        )
-
-        # print(f"Starting High-Level Selector Squad (Docker) in '{work_dir}'...")
-        
-        # 4. Run using .run()
-
-
-        # 4. Run using .run()
+    while True:
         try:
-            print("Starting Agent Team...")
-            result = await team.run(task=task_prompt)
+            if reset_count > 0:
+                print(f"\n[System] Context Reset #{reset_count}. Resuming task with fresh agent memory...")
+                # Optional: Append a system note to the task prompt to inform Manager of the reset
+                # prompts = (prompts[0], prompts[1], prompts[2], prompts[3], prompts[4] + "\n[SYSTEM NOTE: Previous context was reset due to length. Please scan existing files to resume work.]")
+
+            result = await run_team_cycle(work_dir, model_client, memories, prompts)
             
+            # Print Final Result
             print(f"\n{'-'*20} Task Result {'-'*20}")
-            # ... (rest of print logic)
             for message in result.messages:
                 script_source = getattr(message, "source", "Unknown")
                 print(f"\n{'-'*20} {script_source} {'-'*20}")
@@ -255,22 +243,60 @@ async def main():
                 elif hasattr(message, "models_usage"):
                     print(f"[Task Result] Usage: {message.models_usage}")
                 else:
-                        print(message)
+                    print(message)
             
-            print(f"\n{'-'*20} Token Usage {'-'*20}")
-            print(f"Prompt Tokens: {llm_usage.prompt_tokens}")
-            print(f"Completion Tokens: {llm_usage.completion_tokens}")
-            print(f"Total Tokens: {llm_usage.tokens}")
+            print(f"\n[System] Task Completed Successfully.")
+            break # Exit loop on success
 
         except HttpResponseError as e:
+            # Check for 429 Rate Limit
             if e.status_code == 429:
-                    print(f"\n[ERROR] Rate Limit Exceeded (429).")
+                retry_after = int(e.response.headers.get("Retry-After", 60))
+                print(f"\n[System] Rate Limit Exceeded (429). Retry-After: {retry_after}s")
+                
+                if retry_after < 60:
+                    print(f"[System] Wait time is short. Sleeping for {retry_after}s and retrying...")
+                    import time
+                    time.sleep(retry_after + 1) # Add buffer
+                    continue
+                else:
+                    hours = retry_after / 3600
+                    print(f"[System] Wait time is too long ({hours:.2f} hours). Exiting .")
+                    print(f"[System] You can resume the agent after this duration.")
+                    break
+
+            # Check for Token Limit Error (413 Payload Too Large)
+            error_msg = str(e).lower()
+            if "tokens_limit_reached" in error_msg or e.status_code == 413:
+                print(f"\n[System] CRITICAL: Token Limit Reached during cycle.")
+                reset_count += 1
+                if reset_count > max_resets:
+                    print(f"[System] Max resets ({max_resets}) reached. Aborting.")
+                    break
+                print("[System] Triggering Context Reset (Clearing Chat History)...")
+                continue # Restart loop
             else:
-                    print(f"\n[ERROR] Azure API Error: {e.message}")
-        except KeyboardInterrupt:
-            print("\n[INFO] Run cancelled by user.")
+                print(f"\n[ERROR] Unhandled Azure API Error: {e}")
+                break
+        
         except Exception as e:
-                print(f"\n[ERROR] Unexpected error: {str(e)}")
+            if "GroupChatError" in str(type(e)):
+                 # Sometimes GroupChatError wraps the underlying API error
+                 print(f"\n[System] GroupChatError detected. Retrying might fix transient issues.")
+                 # Decide whether to reset or just retry. For now, let's treat it as a crash and break, 
+                 # unless we parse the inner error. 
+                 # Given the user's log, the inner error WAS tokens_limit_reached.
+                 print(f"[ERROR] Detail: {e}")
+                 break
+            
+            print(f"\n[ERROR] Unexpected error: {e}")
+            break
+
+    # Stats Output
+    print(f"\n{'-'*20} Token Usage {'-'*20}")
+    print(f"Prompt Tokens: {llm_usage.prompt_tokens}")
+    print(f"Completion Tokens: {llm_usage.completion_tokens}")
+    print(f"Total Tokens: {llm_usage.tokens}")
 
     await model_client.close()
 
