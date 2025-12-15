@@ -1,4 +1,4 @@
-# Autonomous DevOps Agent Squad
+# AutoOps AI
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Framework](https://img.shields.io/badge/Framework-AutoGen_Core_v0.7.5-purple)
